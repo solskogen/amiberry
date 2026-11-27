@@ -8,7 +8,10 @@ between reads: a data TTR stops (and starts) covering the page, the MMU is
 enabled after an MMU-off read, the page size switches between 4K and 8K,
 user and supervisor see different mappings, an exception goes through the
 vector page, and a page is covered by a data TTR but not an instruction TTR.
-Checks that every read sees the physical page the hardware would.
+It also writes such pages, including through a write-protected data TTR.
+Checks that every access reaches the physical page the hardware would.
+A third 68060 run emulates the data cache to check that an exception stack
+frame written in copyback mode with the MMU off goes straight to RAM.
 
 Usage: mmu040_shortcut_cache_test.py <path-to-amiberry-binary>
 """
@@ -30,7 +33,9 @@ ROM_CODE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "mmu
 ROM_SIZE = 512 * 1024
 RESULTS = 0x2000
 FIELDS = ["magic", "unexp", "1a", "1b", "1c", "1d", "2a", "2b", "2c", "3a", "3b", "3c", "3d",
-          "4a", "4b", "4c", "4d", "4e", "4f", "4g", "5a", "5b", "5c", "5x", "6a", "6c", "6d", "6e"]
+          "4a", "4b", "4c", "4d", "4e", "4f", "4g", "5a", "5b", "5c", "5x", "6a", "6c", "6d", "6e",
+          "7a", "7b", "7c", "7d", "7e", "7g", "7h", "7i", "7j", "7k"]
+FRAME8_FMT = 0x600FC  # PC low word, then format/vector word of case 8's frame
 failures = []
 
 
@@ -104,8 +109,8 @@ class Connection:
         (self._pipe if IS_WINDOWS else self._sock).close()
 
 
-def run(binary, rom, work, cpu, compatible):
-    home = os.path.join(work, f"{cpu}-{'compat' if compatible else 'fast'}")
+def run(binary, rom, work, cpu, compatible, data_cache=False):
+    home = os.path.join(work, f"{cpu}-{'compat' if compatible else 'fast'}{'-dcache' if data_cache else ''}")
     env = dict(os.environ)
     env.update({"HOME": home, "XDG_RUNTIME_DIR": home, "XDG_CONFIG_HOME": os.path.join(home, "config"),
                 "XDG_DATA_HOME": os.path.join(home, "data"), "AMIBERRY_HOME_DIR": os.path.join(home, "home"),
@@ -117,6 +122,7 @@ def run(binary, rom, work, cpu, compatible):
     for setting in (f"cpu_model={cpu}", f"mmu_model={cpu}", "fpu_model=0", "cpu_24bit_addressing=false",
                     "cachesize=0", "cpu_speed=max", "cycle_exact=false", "fastmem_size=0", "z3mem_size=0",
                     "cpu_compatible=" + ("true" if compatible else "false"),
+                    "cpu_data_cache=" + ("true" if data_cache else "false"),
                     "kickstart_rom_file=" + rom, "kickstart_ext_rom_file="):
         args += ["-s", setting]
     output = []
@@ -142,6 +148,8 @@ def run(binary, rom, work, cpu, compatible):
             time.sleep(0.1)
         for index, name in enumerate(FIELDS):
             results[name] = control.read_long(RESULTS + 4 * index)
+        # Physical RAM, not through the emulated data cache
+        results["8a"] = control.read_long(FRAME8_FMT)
         control.request("QUIT")
         control.close()
         proc.wait(15)
@@ -172,38 +180,51 @@ def main():
     try:
         rom = os.path.join(work, "shortcut_cache.rom")
         make_rom(rom)
-        for cpu in (68040, 68060):
-            for compatible in (False, True):
-                p = f"{cpu} cpu_compatible={'on' if compatible else 'off'}"
-                r = run(binary, rom, work, cpu, compatible)
-                detail = " ".join(f"{k}={tag(v)}" for k, v in r.items())
-                check(f"{p}: test ROM finished", r["magic"] == 0x444F4E45 and r["unexp"] == 0xFFFF, detail)
-                expect(r, p, "1a", "IDEN", "DTT0 covering the page reads it untranslated")
-                expect(r, p, "1b", "REMP", "DTT0 disabled: page tables remap the page")
-                expect(r, p, "1c", "IDEN", "DTT0 re-enabled: untranslated again")
-                expect(r, p, "1d", "REMP", "DTT0 moved elsewhere: page tables remap the page")
-                expect(r, p, "2a", "IDEN", "MMU off reads the page untranslated")
-                expect(r, p, "2b", "REMP", "MMU enabled: page tables remap the page")
-                expect(r, p, "2c", "IDEN", "MMU disabled again: untranslated")
-                expect(r, p, "3a", "I43 ", "4K pages: second 4K page is identity mapped")
-                expect(r, p, "3b", "R52 ", "8K pages: first half of the 8K page is remapped")
-                expect(r, p, "3c", "R53 ", "8K pages: second half of the 8K page is remapped")
-                expect(r, p, "3d", "I43 ", "back to 4K pages: identity mapped again")
-                expect(r, p, "4a", "IDEN", "SRP tree: supervisor read untranslated")
-                expect(r, p, "4b", "REMP", "URP tree: user read of the same page remapped")
-                expect(r, p, "4c", "IDEN", "SRP tree: supervisor read untranslated again")
-                expect(r, p, "4d", "IDEN", "supervisor-only DTT0: supervisor read untranslated")
-                expect(r, p, "4e", "REMP", "supervisor-only DTT0: user read remapped")
-                expect(r, p, "4f", "REMP", "user-only DTT0: supervisor read remapped")
-                expect(r, p, "4g", "IDEN", "user-only DTT0: user read untranslated")
-                expect(r, p, "5a", "VEC1", "vector page read before the exception")
-                expect(r, p, "5b", "VEC2", "vector page read after the exception")
-                check(f"{p}: vector read after the exception", r["5c"] is not None and r["5c"] == r["5x"],
-                      f"read {tag(r['5c'])}, expected {tag(r['5x'])}")
-                expect(r, p, "6a", "IDEN", "DTT0 only: data read untranslated")
-                expect(r, p, "6c", "REMP", "DTT0 only: code fetch remapped")
-                expect(r, p, "6d", "IDEN", "DTT0 and ITT0: code fetch untranslated")
-                expect(r, p, "6e", "REMP", "ITT0 disabled again: code fetch remapped")
+        for cpu, compatible, data_cache in ((68040, False, False), (68040, True, False),
+                                        (68060, False, False), (68060, True, False), (68060, True, True)):
+            p = f"{cpu} cpu_compatible={'on' if compatible else 'off'}{' cpu_data_cache=on' if data_cache else ''}"
+            r = run(binary, rom, work, cpu, compatible, data_cache)
+            detail = " ".join(f"{k}={tag(v)}" for k, v in r.items())
+            check(f"{p}: test ROM finished", r["magic"] == 0x444F4E45 and r["unexp"] == 0xFFFF, detail)
+            expect(r, p, "1a", "IDEN", "DTT0 covering the page reads it untranslated")
+            expect(r, p, "1b", "REMP", "DTT0 disabled: page tables remap the page")
+            expect(r, p, "1c", "IDEN", "DTT0 re-enabled: untranslated again")
+            expect(r, p, "1d", "REMP", "DTT0 moved elsewhere: page tables remap the page")
+            expect(r, p, "2a", "IDEN", "MMU off reads the page untranslated")
+            expect(r, p, "2b", "REMP", "MMU enabled: page tables remap the page")
+            expect(r, p, "2c", "IDEN", "MMU disabled again: untranslated")
+            expect(r, p, "3a", "I43 ", "4K pages: second 4K page is identity mapped")
+            expect(r, p, "3b", "R52 ", "8K pages: first half of the 8K page is remapped")
+            expect(r, p, "3c", "R53 ", "8K pages: second half of the 8K page is remapped")
+            expect(r, p, "3d", "I43 ", "back to 4K pages: identity mapped again")
+            expect(r, p, "4a", "IDEN", "SRP tree: supervisor read untranslated")
+            expect(r, p, "4b", "REMP", "URP tree: user read of the same page remapped")
+            expect(r, p, "4c", "IDEN", "SRP tree: supervisor read untranslated again")
+            expect(r, p, "4d", "IDEN", "supervisor-only DTT0: supervisor read untranslated")
+            expect(r, p, "4e", "REMP", "supervisor-only DTT0: user read remapped")
+            expect(r, p, "4f", "REMP", "user-only DTT0: supervisor read remapped")
+            expect(r, p, "4g", "IDEN", "user-only DTT0: user read untranslated")
+            expect(r, p, "5a", "VEC1", "vector page read before the exception")
+            expect(r, p, "5b", "VEC2", "vector page read after the exception")
+            check(f"{p}: vector read after the exception", r["5c"] is not None and r["5c"] == r["5x"],
+                  f"read {tag(r['5c'])}, expected {tag(r['5x'])}")
+            expect(r, p, "6a", "IDEN", "DTT0 only: data read untranslated")
+            expect(r, p, "6c", "REMP", "DTT0 only: code fetch remapped")
+            expect(r, p, "6d", "IDEN", "DTT0 and ITT0: code fetch untranslated")
+            expect(r, p, "6e", "REMP", "ITT0 disabled again: code fetch remapped")
+            expect(r, p, "7a", "W7A ", "DTT0 covering the page: write untranslated")
+            expect(r, p, "7b", "W7B ", "DTT0 disabled: page tables remap the write")
+            expect(r, p, "7c", "W7C ", "MMU off: write untranslated")
+            expect(r, p, "7d", "W7D ", "MMU enabled: page tables remap the write")
+            expect(r, p, "7e", "W7E ", "write-protected DTT0: write not performed")
+            expect(r, p, "7g", "FALT", "write-protected DTT0: write takes an access fault")
+            expect(r, p, "7h", "W7H ", "DTT0 disabled: write cache hit remaps the write")
+            expect(r, p, "7i", 0, "DTT0 disabled: write cache hit leaves the logical page alone")
+            expect(r, p, "7j", "W7J ", "MMU enabled: write cache hit remaps the write")
+            expect(r, p, "7k", 0, "MMU enabled: write cache hit leaves the logical page alone")
+            check(f"{p}: MMU off, copyback: exception stack frame written to RAM",
+                  r["8a"] is not None and (r["8a"] & 0xFFFF) == 33 * 4,
+                  f"format/vector word {tag(r['8a'] & 0xFFFF if r['8a'] is not None else None)}, expected {tag(33 * 4)}")
     finally:
         shutil.rmtree(work, ignore_errors=True)
     if failures:

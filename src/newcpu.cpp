@@ -1845,7 +1845,7 @@ void set_cpu_caches (bool flush)
 {
 	regs.prefetch020addr = 0xffffffff;
 	regs.cacheholdingaddr020 = 0xffffffff;
-	cache_default_data &= ~CACHE_DISABLE_ALLOCATE;
+	mmu_set_cache_default_data(cache_default_data & ~CACHE_DISABLE_ALLOCATE);
 
 	// 68060 FIC 1/2 instruction cache
 	cacheisets04060 = currprefs.cpu_model == 68060 && !(regs.cacr & 0x00002000) ? CACHESETS060 : CACHESETS040;
@@ -3078,7 +3078,7 @@ static void Exception_mmu (int nr, uaecptr oldpc)
 
 	// exception vector fetch and exception stack frame
 	// operations don't allocate new cachelines
-	cache_default_data |= CACHE_DISABLE_ALLOCATE;
+	mmu_set_cache_default_data(cache_default_data | CACHE_DISABLE_ALLOCATE);
 
 	exception_debug (nr);
 	MakeSR ();
@@ -3130,7 +3130,7 @@ static void Exception_mmu (int nr, uaecptr oldpc)
 		return;
 	}
 
-	cache_default_data &= ~CACHE_DISABLE_ALLOCATE;
+	mmu_set_cache_default_data(cache_default_data & ~CACHE_DISABLE_ALLOCATE);
 
 	m68k_setpci (newpc);
 	if (interrupt)
@@ -3211,7 +3211,7 @@ static void Exception_normal (int nr)
 	int vector_nr = nr;
 	bool g1 = false;
 
-	cache_default_data |= CACHE_DISABLE_ALLOCATE;
+	mmu_set_cache_default_data(cache_default_data | CACHE_DISABLE_ALLOCATE);
 
 	interrupt = nr >= 24 && nr < 24 + 8;
 	if (interrupt)
@@ -3487,7 +3487,7 @@ kludge_me_do:
 	}
 	add_approximate_exception_cycles(nr);
 	m68k_setpc (newpc);
-	cache_default_data &= ~CACHE_DISABLE_ALLOCATE;
+	mmu_set_cache_default_data(cache_default_data & ~CACHE_DISABLE_ALLOCATE);
 #ifdef JIT
 	if (currprefs.cachesize) {
 		set_special(SPCFLAG_END_COMPILE);
